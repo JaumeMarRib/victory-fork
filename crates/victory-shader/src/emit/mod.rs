@@ -522,18 +522,22 @@ pub fn emit(
                 forms[0].1.as_ref().map(|f| &f.0),
                 Some(p),
             ];
-            if let Some(base) = bases.into_iter().flatten().next() {
+            // each form in turn, the first that translates (a skip whose scalars the code after
+            // reads stays in the deep form, and a sampler built inside it is then not known at
+            // the join: `CS_AlphTransmissionPrefilterMip`)
+            let pairs_on = std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0");
+            for (n, base) in bases.into_iter().flatten().enumerate() {
                 let again = widen(c, native, base, why);
-                report("wave-wide branches, last resort", &again);
+                report(&format!("wave-wide branches, last resort (form {n})"), &again);
                 if done(&again) {
                     return again.map(|(shader, _)| shader);
                 }
                 // Several console waves a group (`CS_DefragHeap_ComputeRelocations`): the
                 // same, with each console wave's two host waves meeting on their own.
                 // `VICTORY_WAVE_PAIRS=0` leaves those programs refused.
-                if std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0") {
+                if pairs_on {
                     let again = widen_with(c, native, base, why, true);
-                    report("wave-wide branches, host waves meeting in pairs", &again);
+                    report(&format!("wave-wide branches, host waves meeting in pairs (form {n})"), &again);
                     if done(&again) {
                         return again.map(|(shader, _)| shader);
                     }
@@ -647,6 +651,14 @@ fn widen_with(
             .into_iter()
             .filter(|b| !wide.contains(b))
             .collect();
+        if why {
+            let at = |b: usize| p.blocks.get(b).map_or(0, |blk| blk.offset);
+            eprintln!(
+                "WAVE64-WIDE widening {:?} (needs at {:?})",
+                more.iter().map(|&b| format!("{:#x}", at(b))).collect::<Vec<_>>(),
+                needs.iter().map(|&b| format!("{:#x}", at(b))).collect::<Vec<_>>()
+            );
+        }
         if more.is_empty() {
             if why {
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());

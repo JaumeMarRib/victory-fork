@@ -1124,6 +1124,16 @@ impl<'a> Tracer<'a> {
             .ok_or("a descriptor not in SGPRs")?;
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // With branches the wave takes together ([`Structured::wide`]) a lane past one learns
+        // nothing from the way it went: what it knows of itself is in the instruction's guard
+        // (EXEC), which only the lanes that run the access hold.
+        if let Some(l) = self.lanes
+            && !l.wide.is_empty()
+            && let Some(i) = self.p.blocks[at].insts.iter().position(|x| x.machine.offset == inst.machine.offset)
+            && let Some(Some(guard)) = l.guards.get(at).and_then(|g| g.get(i))
+        {
+            known.push((*guard, true));
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
