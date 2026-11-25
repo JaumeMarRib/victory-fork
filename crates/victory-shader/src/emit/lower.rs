@@ -883,6 +883,21 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     if (0..n).any(|r| reads[r] && writes[r]) {
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+                let mut line = format!("LDS-REGION {r}:");
+                for (b, block) in p.blocks.iter().enumerate().take(n) {
+                    if all[b] || find(&mut region, b) != r { continue; }
+                    line += &format!(" [b{b}]");
+                    for i in &block.insts {
+                        if matches!(i.fields, Fields::Ds { .. }) {
+                            line += &format!(" {:x}:{}", i.machine.offset, i.machine.text(true));
+                        }
+                    }
+                }
+                eprintln!("{line}");
+            }
+        }
         return None;
     }
     let mut meet = vec![(false, false); n];
