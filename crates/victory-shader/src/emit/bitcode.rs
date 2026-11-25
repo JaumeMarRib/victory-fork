@@ -496,6 +496,31 @@ impl Module {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
     }
+    /// Moves what `block` holds so far (its phis and body) into a new block that takes its place
+    /// as the target of every branch to it, and returns that block. `block` keeps its terminator,
+    /// if it has one, and goes on after the new one: code a caller still emits into `block` lands
+    /// after what was moved, once the new block is branched to `block` (directly or through other
+    /// blocks put between them).
+    pub fn split_front(&mut self, block: usize) -> usize {
+        let front = self.new_block();
+        let phis = std::mem::take(&mut self.blocks[block].phis);
+        let body = std::mem::take(&mut self.blocks[block].body);
+        self.blocks[front].phis = phis;
+        self.blocks[front].body = body;
+        let to = |t: usize| if t == block { front } else { t };
+        for (b, blk) in self.blocks.iter_mut().enumerate() {
+            if b == front {
+                continue;
+            }
+            blk.term = match blk.term {
+                Some(Term::Br(t)) => Some(Term::Br(to(t))),
+                Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
+                other => other,
+            };
+        }
+        front
+    }
+
     pub fn terminate(&mut self, block: usize, t: Term) {
         self.blocks[block].term = Some(t);
     }

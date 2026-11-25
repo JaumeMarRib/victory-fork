@@ -528,6 +528,16 @@ pub fn emit(
                 if done(&again) {
                     return again.map(|(shader, _)| shader);
                 }
+                // Several console waves a group (`CS_DefragHeap_ComputeRelocations`): the
+                // same, with each console wave's two host waves meeting on their own.
+                // `VICTORY_WAVE_PAIRS=0` leaves those programs refused.
+                if std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0") {
+                    let again = widen_with(c, native, base, why, true);
+                    report("wave-wide branches, host waves meeting in pairs", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
             }
         }
     }
@@ -578,6 +588,18 @@ fn widen(
     p: &ir::Program,
     why: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    widen_with(c, native, p, why, false)
+}
+
+/// [`widen`]; with `pairs`, also for a thread group of several console waves, the two host
+/// waves of each meeting on their own ([`lower::with_pair_meetings`]).
+fn widen_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    why: bool,
+    pairs: bool,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
         what: "wave-wide branches in a thread group of several console waves",
@@ -586,6 +608,9 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // several console waves a group: their halves meet in pairs instead
+        // ([`lower::with_pair_meetings`]), as the last resort only
+        crate::native::StageIo::Cs(_) if pairs => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -600,7 +625,11 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let r = if pairs {
+            lower::with_pair_meetings(|| emit_program(c, native, p, &st, &io, &res))
+        } else {
+            emit_program(c, native, p, &st, &io, &res)
+        };
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
