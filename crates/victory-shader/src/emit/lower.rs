@@ -3811,11 +3811,20 @@ impl<'a> Lower<'a> {
             self.group_sync(at);
             return at;
         };
-        if at == self.s.entry {
-            // (the entry block opens the function: nothing can go before it)
-            self.pair_failed = true;
-            return at;
-        }
+        // The entry block opens the function and nothing can go before it: a meeting asked for
+        // there (a mask the program starts with, exchanged) is held at the start of the block it
+        // jumps to, which every thread runs next (with pair meetings the entry only makes values).
+        let at = if at == self.s.entry {
+            match self.s.m.jump_target(at) {
+                Some(next) => next,
+                None => {
+                    self.pair_failed = true;
+                    return at;
+                }
+            }
+        } else {
+            at
+        };
         let i32t = self.s.t.i32;
         let counter = match self.pair_counter {
             Some(v) => v,

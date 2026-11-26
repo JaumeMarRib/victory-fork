@@ -496,6 +496,14 @@ impl Module {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
     }
+    /// Where `block`'s unconditional branch goes, if it ends in one.
+    pub fn jump_target(&self, block: usize) -> Option<usize> {
+        match self.blocks[block].term {
+            Some(Term::Br(t)) => Some(t),
+            _ => None,
+        }
+    }
+
     /// Moves what `block` holds so far (its phis and body) into a new block that takes its place
     /// as the target of every branch to it, and returns that block. `block` keeps its terminator,
     /// if it has one, and goes on after the new one: code a caller still emits into `block` lands
