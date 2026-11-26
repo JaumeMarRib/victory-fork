@@ -401,7 +401,27 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// The width the dispatch being bound was folded to, or 0
+    /// (`victory_shader::emit::USER_GROUP_FOLD`, [`State::dispatch`]).
+    fold: u32,
 }
+
+/// Whether a compute pipeline's translated shader takes the fold width
+/// (`victory_shader::emit::USER_GROUP_FOLD`): it reads a group id.
+fn reads_fold(p: &HostPipeline) -> bool {
+    p.stages.first().is_some_and(|stage| {
+        stage
+            .translated()
+            .host
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(victory_shader::emit::USER_GROUP_FOLD))
+    })
+}
+
+/// Direct dispatches folded to fit the host ([`State::dispatch`]), since
+/// the last frame line.
+pub(crate) static FOLDED: AtomicU64 = AtomicU64::new(0);
 
 impl Drop for State {
     fn drop(&mut self) {
@@ -935,7 +955,13 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_GROUP_FOLD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
+        if kind == USER_GROUP_FOLD {
+            // Indirect dispatches are not folded in this tree: 0 there.
+            return if compute { self.fold } else { 0 };
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -2245,7 +2271,33 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        // More groups in X than the host runs in one dimension: run as
+        // `(w, k, 1)`, the shader told `w` (`victory_shader::emit::
+        // USER_GROUP_FOLD`). A shader that reads no group id needs only
+        // the count. One that cannot be folded exactly is cut, as the host
+        // would refuse it.
+        let most = victory_shader::emit::HOST_GROUPS_PER_DIMENSION;
+        let (x, y, fold) = match victory_shader::emit::fold_groups(x, y, z) {
+            Some((w, k)) => {
+                FOLDED.fetch_add(1, Ordering::Relaxed);
+                (w, k, if reads_fold(p) { w } else { 0 })
+            }
+            None if x > most || y > most || z > most => {
+                once!(
+                    x,
+                    y,
+                    z,
+                    "a dispatch with more groups than the host runs, not foldable: cut to 65,535 a dimension"
+                );
+                (x.min(most), y.min(most), 0)
+            }
+            None => (x, y, 0),
+        };
+        let z = z.min(most);
+        self.fold = fold;
+        let bound = self.bind(list, p, true);
+        self.fold = 0;
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2574,7 +2626,7 @@ impl State {
             let draws: u32 = census.1.values().sum();
             if draws > 0 {
                 let mut rects: Vec<([i32; 4], u32)> = census.1.iter().map(|(r, n)| (*r, *n)).collect();
-                rects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                rects.sort_unstable_by_key(|r| std::cmp::Reverse(r.1));
                 let scissors: Vec<String> = rects
                     .iter()
                     .take(5)
@@ -2736,9 +2788,7 @@ impl State {
                 .unwrap_or(0)
                 + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
-            if n > crate::descriptor::host::DYNAMIC
-                || last.and_then(|handle| heap.index(handle)).is_none()
-            {
+            if n > host.dynamic_slots() || last.and_then(|handle| heap.index(handle)).is_none() {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }

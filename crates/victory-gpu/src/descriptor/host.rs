@@ -19,9 +19,11 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
-    /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
-    /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
+    /// Dynamic slots past `count`: in view heaps [`dynamic_slots`]'s
+    /// answer ([`DYNAMIC`], or [`DYNAMIC_UNCAPPED`] where the heap has room),
+    /// none in sampler heaps. (Upstream falls back to 2^16 on a capped host
+    /// heap; ours keeps 2^18 there: 2^16 and 2^17 both ran out in this
+    /// title.)
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -856,6 +858,36 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// The dynamic slots of a view heap on a host that does not cap view heaps
+/// (AMD), where the title's slots and these still fit below the null slot
+/// of [`UNCAPPED_VIEWS`] (about 1,245,000 and 524,288 of 2,097,151): twice
+/// [`DYNAMIC`]. A fork on an RX 9070 XT (Belobug's, 2aad398) found a world
+/// frame of some 7,000 draws holding over 400,000 dynamic slots, and the
+/// draws whose tables no longer fit dropped (a subsurface resolve, tree
+/// imposters). The heap is made at its full size either way, so this costs
+/// no card memory. On a capped host (NVIDIA, 1,000,000 views) the dynamic
+/// slots are the top of the title's own range, and more of them would push
+/// more of the title's tables out to be made afresh per draw: [`DYNAMIC`]
+/// stays there.
+const DYNAMIC_UNCAPPED: u32 = 1 << 19;
+
+/// The dynamic slots of a view heap of `count` title slots whose null slot
+/// is `null` (0: no limit picked, the heap made at the title's size plus
+/// these).
+fn dynamic_slots(count: u32, null: u32) -> u32 {
+    if null != 0 && count.saturating_add(DYNAMIC_UNCAPPED) <= null {
+        DYNAMIC_UNCAPPED
+    } else {
+        DYNAMIC
+    }
+}
+
+/// Since the last frame line: the most dynamic slots one view heap had in
+/// use, that heap's dynamic slots, and the tables refused for want of room
+/// (a draw that needs one is dropped).
+pub(crate) static DYNAMIC_STATS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -876,7 +908,6 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -887,6 +918,11 @@ impl HostHeap {
             0
         } else {
             victory_shader::emit::view_heap_limit()
+        };
+        let extra = if sampler {
+            0
+        } else {
+            dynamic_slots(count, null)
         };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
@@ -953,8 +989,8 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -1068,7 +1104,7 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { self.dynamic as usize } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -1084,8 +1120,9 @@ impl HostHeap {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
+            DYNAMIC_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made (counted on the frame line)"));
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1097,8 +1134,11 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        // (Under `next`'s lock, as every change of `free`: at least `n`.)
+        let free = self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed).saturating_sub(n as u32);
+        *next = ((first + n) % self.dynamic as usize) as u32;
+        DYNAMIC_STATS[0].fetch_max(u64::from(self.dynamic - free), std::sync::atomic::Ordering::Relaxed);
+        DYNAMIC_STATS[1].fetch_max(u64::from(self.dynamic), std::sync::atomic::Ordering::Relaxed);
         Some(self.count + first as u32)
     }
 
@@ -1106,6 +1146,11 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// The dynamic slots past [`HostHeap::count`] (0 for samplers).
+    pub(crate) fn dynamic_slots(&self) -> u32 {
+        self.dynamic
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -3597,6 +3642,30 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// Twice the dynamic slots only where the title's heap and they fit
+    /// below the null slot of an uncapped host; as before everywhere else.
+    #[test]
+    fn uncapped_heaps_take_twice_the_dynamic_slots_where_they_fit() {
+        let (uncapped, capped) = (UNCAPPED_VIEWS - 1, PORTABLE_VIEWS - 1);
+        // The retail title's view heap.
+        let title = 1_245_184;
+        assert_eq!(dynamic_slots(title, uncapped), DYNAMIC_UNCAPPED);
+        assert!(title + DYNAMIC_UNCAPPED <= uncapped);
+        // NVIDIA's cap, and no limit picked: as before.
+        assert_eq!(dynamic_slots(title, capped), DYNAMIC);
+        assert_eq!(dynamic_slots(title, 0), DYNAMIC);
+        // A title heap with no room for twice: as before.
+        assert_eq!(
+            dynamic_slots(uncapped - DYNAMIC_UNCAPPED + 1, uncapped),
+            DYNAMIC
+        );
+        assert_eq!(
+            dynamic_slots(uncapped - DYNAMIC_UNCAPPED, uncapped),
+            DYNAMIC_UNCAPPED
+        );
+        assert_eq!(dynamic_slots(u32::MAX, uncapped), DYNAMIC);
     }
 
     #[test]

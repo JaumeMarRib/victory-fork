@@ -404,6 +404,21 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
 /// `ID3D12Device9` to `ID3D12Device11`, whose console layout is unknown.
 /// Every slot exists so that a call to one we have not written logs it.
+/// `GetDeviceRemovedReason`: the host device's state, as the console's
+/// device is removed when the host's is (upstream VIctory 13185f5). Left on
+/// the default handler it answered `E_NOTIMPL` on a healthy device, which a
+/// title checking `FAILED(GetDeviceRemovedReason())` takes for a lost one.
+extern "system" fn removed_reason(_: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        // SAFETY: a plain query.
+        if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
+            return e.code().0;
+        }
+    }
+    S_OK
+}
+
 static FUNCTIONS: Table<160> = {
     let mut f = object::d3d12_object(object::missing_table::<{ object::DEVICE }, 160>());
     f[0] = query_interface as *const (); // 0x00
@@ -431,6 +446,7 @@ static FUNCTIONS: Table<160> = {
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
     f[36] = fence::create as *const (); // 0x120
+    f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
@@ -486,6 +502,13 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
+    }
+
+    #[test]
+    fn a_healthy_device_reports_no_removal() {
+        let device = super::device();
+        let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
+        assert_eq!(reason(device), S_OK);
     }
 
     #[test]

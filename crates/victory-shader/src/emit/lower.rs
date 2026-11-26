@@ -2367,7 +2367,7 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => return self.group_id(c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -2433,6 +2433,33 @@ impl<'a> Lower<'a> {
     }
 
     /// A component of a compute thread or group id, read in the entry block.
+    /// The console's group id in dimension `c` of a compute program, as the
+    /// host runs it: a dispatch folded to width `w`
+    /// ([`super::shader::USER_GROUP_FOLD`]) ran as `(w, x / w, 1)`, so X is
+    /// `group.x + group.y * w` and Y is 0. Unfolded (`w` 0) the host's ids
+    /// are the console's. Z is never folded.
+    fn group_id(&mut self, c: u8) -> Val {
+        if self.x.native.stage != HwStage::Cs || c > 1 {
+            return self.compute_id("groupId.i32", 94, c);
+        }
+        let w = self.host_word(RootType::Other(super::shader::USER_GROUP_FOLD), 0, 0);
+        let (Val::I32(x), Val::I32(y)) = (
+            self.compute_id("groupId.i32", 94, 0),
+            self.compute_id("groupId.i32", 94, 1),
+        ) else {
+            unreachable!()
+        };
+        let e = self.s.entry;
+        Val::I32(if c == 0 {
+            let row = self.s.m.bin(e, Bin::Mul, y, w);
+            self.s.m.bin(e, Bin::Add, x, row)
+        } else {
+            let zero = self.s.m.i32(0);
+            let folded = self.s.m.cmp(e, pred::NE, w, zero);
+            self.s.m.select(e, folded, zero, y)
+        })
+    }
+
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
         let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
         Val::I32(
@@ -4327,6 +4354,31 @@ impl<'a> Lower<'a> {
         let lane = self.s.m.select(c, any, lane, me);
         let at = self.read_lane(x, lane);
         (self.s.m.select(c, any, at, first), any)
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead (upstream VIctory 0601955).
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes with that
+    /// value, take them out of EXEC) serves helper lanes too. On the host,
+    /// wave operations leave helper lanes out: once only helper lanes are
+    /// left in such a loop, `WaveReadLaneFirst` reads no lane, no lane
+    /// matches, and the loop runs to [`LOOP_LIMIT`] in every such lane
+    /// (upstream measured draws of 0.3 to 1.3 s each, then DEVICE_HUNG).
+    /// With its own value a helper lane matches in the first pass and
+    /// leaves; what a helper lane computes only feeds derivatives, and its
+    /// stores are dropped. Waterfall reads the proof turns into per-lane
+    /// reads do not come here.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -7677,6 +7729,7 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
@@ -9292,6 +9345,26 @@ impl<'a> Lower<'a> {
                     self.as_int(f)
                 } else if f16 {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    // VOP3 (as GFX10 encodes the f16 interpolations): omod
+                    // and clamp are part of the instruction, applied in f32
+                    // so the conversion rounds once (`write_f`'s order), and
+                    // op_sel[3] picks the destination half (upstream VIctory
+                    // e29391f). They were dropped, and the low half always
+                    // written.
+                    if let Fields::Valu(v) = &inst.fields {
+                        let mut f = f;
+                        if v.omod != 0 {
+                            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod & 3)];
+                            let k = self.s.m.f32(factor.to_bits());
+                            f = self.s.m.bin(c, Bin::Mul, f, k);
+                        }
+                        if v.clamp {
+                            f = self.unary(7, f);
+                        }
+                        let x = to_f16(self, f);
+                        // A pixel interpolates in every lane.
+                        return self.write_half(inst, x, None);
+                    }
                     let lo = to_f16(self, f);
                     self.low_half(inst, reg, lo)
                 } else if matches!(eval, Eval::Mode(1)) {
@@ -11510,6 +11583,61 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
+    }
+
+    /// [`lowers`], keeping what lowering made.
+    fn lowered_with_rsrc2(words: &[u32], rsrc2: u32) -> Lowered {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_program_that_reads_its_group_asks_for_the_fold() {
+        use crate::emit::shader::USER_GROUP_FOLD;
+        let fold = |l: &Lowered| {
+            l.user_data
+                .iter()
+                .filter(|u| u.root == RootType::Other(USER_GROUP_FOLD))
+                .count()
+        };
+        let group_ids_xy = 3 << 7;
+        // Reads group X (s0) and group Y (s1): one fold dword for both.
+        let reads = [
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0xBF06_8101, // s_cmp_eq_u32 s1, 1
+            S_ENDPGM,
+        ];
+        assert_eq!(fold(&lowered_with_rsrc2(&reads, group_ids_xy)), 1);
+        // Reads no group id: none.
+        assert_eq!(fold(&lowered_with_rsrc2(&[S_ENDPGM], group_ids_xy)), 0);
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user

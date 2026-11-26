@@ -612,6 +612,15 @@ by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
 `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
 Each is described in a comment where it is read.
 
+### Local patch on top of this fork (against dc4c0fc)
+
+Small, conservative changes; each has a switch or a log line so its effect can be checked in a run.
+- Direct dispatches wider than 65,535 groups in one dimension are folded into two dimensions by an exact factor search, and the translated program rebuilds the console group index (`USER_GROUP_FOLD`); a dispatch that cannot be folded is cut as before. The log counts folded dispatches. Indirect dispatches are left to the fork's own clamp (`VICTORY_INDIRECT_GATHER`).
+- Dynamic descriptor slots: hosts without a cap on shader-visible views get 2^19 slots for per-draw tables (NVIDIA keeps 2^18 under its 1,000,000 cap); the log shows the peak in use and tables refused.
+- Title writes that land in a range shaders are still writing can be copied in when the range is refreshed (`VICTORY_BUSY_MERGE=1`; off by default, since each refresh then asks the kernel for written pages and waits on the memory lock: 460 to 1,250 ms a frame in a run); the log shows pages and bytes brought in.
+- Mip levels on demand stay off by default, as in the fork: turned on (`VICTORY_LEVELS_ON_DEMAND=1`) a run went from about 1.25 to 7.6 s a frame, nearly all of it texture refreshes waiting for title memory to hold still.
+- From upstream VIctory: helper lanes at `v_readfirstlane`, f16 interpolation modifiers, a cap on the branch-structure memo, `GetDeviceRemovedReason` in the device table, and several smaller fixes.
+
 ### Known problems
 
 - Everything in shadow is black (see above).

@@ -101,6 +101,11 @@ const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
 /// Case splits [`Bools::meet`] makes before it gives up.
 const MAX_MEET: usize = 1 << 16;
+/// Entries of the `ite` memo before it is cleared (upstream VIctory
+/// f177aae): complex programs made it resize to tens of MB (35 MB at 2^21
+/// buckets) on every translating thread at once. A cache only: clearing it
+/// changes no result.
+const MAX_MEMO: usize = 1 << 18;
 /// Conditions [`Meets`] keeps; past that, they are searched anew.
 const MAX_MEETS: usize = 1 << 18;
 
@@ -194,6 +199,10 @@ impl Bools {
     }
 
     fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
+        // The caller fails once it sees `overflow`: no more work for it.
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -212,7 +221,12 @@ impl Bools {
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
         let r = self.mk(v, lo, hi);
-        self.memo.insert((f, g, h), r);
+        if !self.overflow {
+            if self.memo.len() >= MAX_MEMO {
+                self.memo.clear();
+            }
+            self.memo.insert((f, g, h), r);
+        }
         r
     }
 
@@ -340,6 +354,9 @@ impl Bools {
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         let (v, lo, hi) = self.nodes[b.0 as usize];
         if v == TERMINAL {
             return b;

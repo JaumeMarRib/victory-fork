@@ -1952,6 +1952,16 @@ fn back_piece(
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Refreshes under ranges shaders write ([`Shadow::update_busy`]) that
+/// could not bring in all the title wrote there, since the start.
+pub(crate) static BUSY_LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether [`Shadow::update_busy`] runs (`VICTORY_BUSY_MERGE=1`).
+fn busy_merge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUSY_MERGE").is_some_and(|v| v == "1"))
+}
+
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
@@ -3560,9 +3570,62 @@ impl Shadow {
             if at < to {
                 bytes += self.update_free(at, to);
             }
+            // Under them: what the title wrote since the copy took it.
+            bytes += self.update_busy(from, to);
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// [`Shadow::update`] of the parts of `[from, to)` that a list declared
+    /// as written by shaders (`pending`): an earlier list of this same
+    /// submission, whose shaders have not run yet, or a flight in the air
+    /// (`crate::host::late`). Left alone, the title's writes there since
+    /// the copy took the range (constants and sizes a later list of the
+    /// submission reads, or the title's buffer copies, which run at
+    /// submission) stayed stale for the whole submission: upstream
+    /// VIctory ed0dbfd saw a dispatch read its sizes as zeros and loop
+    /// until the device was removed. The bytes the title changed, and only
+    /// those, go into the copy and into what copy-back compares with
+    /// ([`Shadow::merge_under_writes`], as for flights in the air), so
+    /// copy-back neither takes them for the shaders' nor puts them back
+    /// over a later write of the title's. Returns the bytes put in.
+    ///
+    /// Where that cannot be done (memory not write-watched, no snapshot,
+    /// more changed runs than one submission sends up) the rest stays as
+    /// before, counted and said once.
+    ///
+    /// Off unless `VICTORY_BUSY_MERGE=1`: on this fork each such refresh
+    /// asks the kernel for the pages written (`crate::watch::writes`),
+    /// which holds the memory lock the runtime's remapping also takes; a
+    /// run on an RTX 4070 (2026-11-25) went from about 460 to 1,250 ms a
+    /// frame with it, waiting for memory to hold still.
+    fn update_busy(&self, from: usize, to: usize) -> usize {
+        if !busy_merge() {
+            return 0;
+        }
+        // More than enough for one refresh; each is a copy of its own to a
+        // copy in the card's memory.
+        const RUNS: usize = 4096;
+        let before = MERGED[2].load(Ordering::Relaxed);
+        let mut runs_left = RUNS;
+        if self.merge_under_writes(from, to - from, &mut runs_left) {
+            BUSY_LEFT.fetch_add(1, Ordering::Relaxed);
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::warn!(
+                    copy = self.id,
+                    range = format_args!("{from:#x}..{to:#x}"),
+                    watched = self.watched.load(Ordering::Relaxed) != NOT_WATCHED,
+                    "title writes under a range shaders write could not all be brought to the copy \
+                     (memory not write-watched, no snapshot, or too many changed runs): the card may \
+                     read them a submission late (logged once; counted on the merge line)"
+                )
+            });
+        }
+        // (Other threads' merges may count meanwhile: an estimate, for the
+        // caller's byte count only.)
+        MERGED[2].load(Ordering::Relaxed).saturating_sub(before) as usize
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -3665,7 +3728,7 @@ impl Shadow {
                                 refreshed = format_args!("{from:#x}..{to:#x}"),
                                 on_the_card = self.card.is_some(),
                                 window = self.window,
-                                "a host copy of title memory is stale after its refresh, three times in a row:                                  the memory changed with nothing to tell of it (VICTORY_REFRESH_CHECK=1)"
+                                "a host copy of title memory is stale after its refresh, three times in a row: the memory changed with nothing to tell of it (VICTORY_REFRESH_CHECK=1)"
                             );
                         }
                     }
@@ -4786,4 +4849,80 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// The title writes a constant under a range an earlier list of the
+    /// submission declared as written by shaders (upstream VIctory
+    /// ed0dbfd): the refresh before the submission runs still brings it to
+    /// the copy, a shader's write still goes back, and a title write made
+    /// after the refresh is not undone.
+    #[test]
+    fn title_writes_under_a_busy_range_are_copied() {
+        if !busy_merge() {
+            return; // off unless VICTORY_BUSY_MERGE=1
+        }
+        let len = 2 * PAGE;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64).filter(|c| c.card.is_none()) else {
+            unregister(p, p as u64);
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            return; // no host GPU here (or a copy in the card's memory)
+        };
+        let start = copy.start as usize;
+        let title = |at: usize| (p + at) as *mut u8;
+        // SAFETY: (`host`) bytes inside the copy's mapping.
+        let host = |at: usize| unsafe { copy.data.add(p + at - start).read_volatile() };
+        copy.update(p, len);
+        // An earlier list declares all of it as written by shaders.
+        copy.writing(p, len);
+        // SAFETY: (all title writes below) bytes of our allocation.
+        unsafe { title(PAGE + 20).write_volatile(0x55) };
+        copy.update(p + PAGE + 16, 16);
+        assert_eq!(
+            host(PAGE + 20),
+            0x55,
+            "the title's constant reaches the copy"
+        );
+        // The shaders run: one byte written. The title writes meanwhile.
+        // SAFETY: a byte inside the copy's mapping.
+        unsafe { copy.data.add(p + 10 - start).write_volatile(0xaa) };
+        unsafe { title(PAGE + 20).write_volatile(0x66) };
+        copy.copy_back(p, len);
+        // SAFETY: bytes of our allocation.
+        unsafe {
+            assert_eq!(
+                title(10).read_volatile(),
+                0xaa,
+                "the shader's write goes back"
+            );
+            assert_eq!(
+                title(PAGE + 20).read_volatile(),
+                0x66,
+                "the title's later write stays"
+            );
+        }
+        unregister(p, p as u64);
+        drop(copy);
+        // SAFETY: our allocation; the copy is let go above.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
 }

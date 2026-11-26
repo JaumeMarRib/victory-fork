@@ -4033,12 +4033,30 @@ fn late_line(frames: f64) {
             );
         }
     }
-    if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+    let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+    let left = crate::shadow::BUSY_LEFT.load(Ordering::Relaxed);
+    if late_exact() || pages > 0.0 || left > 0 {
         tracing::info!(
-            "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
+            "title bytes put in under ranges shaders write (flights in the air, or earlier lists of the same \
+             submission) per frame: {pages:.0} pages looked at, {runs:.0} changed runs, {:.2} MB; refreshes that \
+             could not bring in all of them, since the start: {left}",
             bytes / (1 << 20) as f64
+        );
+    }
+    {
+        use crate::descriptor::host::DYNAMIC_STATS;
+        let [peak, slots, refused] =
+            [0, 1, 2].map(|i| DYNAMIC_STATS[i].swap(0, Ordering::Relaxed));
+        if slots > 0 {
+            tracing::info!(
+                "dynamic descriptor slots (tables made afresh for draws): at most {peak} of {slots} in use since the last line, {refused} tables refused for want of room (each drops its draw)"
+            );
+        }
+    }
+    let folded = crate::draw::FOLDED.swap(0, Ordering::Relaxed);
+    if folded > 0 {
+        tracing::info!(
+            "direct dispatches folded to fit 65,535 groups a dimension since the last line: {folded}"
         );
     }
 }

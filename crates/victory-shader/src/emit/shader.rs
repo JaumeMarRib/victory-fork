@@ -69,6 +69,86 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// width a compute dispatch was folded to, or 0. A console dispatch can ask
+/// for more groups in X than the host runs in one dimension (65,535); the
+/// host then runs one of `x` groups as `(w, x / w, 1)` and sets this dword
+/// to `w`, and the shader takes the console's group X as
+/// `group.x + group.y * w` and its group Y as 0. With 0 the group ids are
+/// the host's. Asked for by every compute program that reads a group id.
+pub const USER_GROUP_FOLD: u32 = 0x104;
+
+/// The most groups the host runs in one dimension of a dispatch.
+pub const HOST_GROUPS_PER_DIMENSION: u32 = 65_535;
+
+/// Divisors tried by [`fold_groups`] (and by the GPU's copy of it, the
+/// indirect-argument clamp), from the smallest that can fit.
+pub const FOLD_TRIES: u32 = 1024;
+
+/// How the host runs a dispatch of `(x, y, z)` groups that asks for more
+/// than [`HOST_GROUPS_PER_DIMENSION`] in X: `Some((w, k))` to run it as
+/// `(w, k, 1)` with `w * k == x` exactly and `w` as the
+/// [`USER_GROUP_FOLD`] dword; `None` if it needs no fold (X fits) or has
+/// none: Y or Z is not 1, or no `k` of the first [`FOLD_TRIES`] from
+/// `ceil(x / 65,535)` up divides `x` (a prime X, say).
+///
+/// Exact, so that no extra group runs: the shader is not told the
+/// console's X and could not leave the groups past it out.
+pub fn fold_groups(x: u32, y: u32, z: u32) -> Option<(u32, u32)> {
+    let most = HOST_GROUPS_PER_DIMENSION;
+    if x <= most || y != 1 || z != 1 {
+        return None;
+    }
+    let first = x.div_ceil(most);
+    (first..first.saturating_add(FOLD_TRIES))
+        .take_while(|&k| k <= most)
+        .find(|&k| x.is_multiple_of(k))
+        .map(|k| (x / k, k))
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+
+    #[test]
+    fn a_dispatch_that_fits_is_not_folded() {
+        assert_eq!(fold_groups(65_535, 1, 1), None);
+        assert_eq!(fold_groups(1, 1, 1), None);
+        assert_eq!(fold_groups(0, 1, 1), None);
+    }
+
+    #[test]
+    fn the_titles_wide_pass_folds_exactly() {
+        // The indirect compute pass the fork's README counts: 77,500 groups.
+        assert_eq!(fold_groups(77_500, 1, 1), Some((38_750, 2)));
+        assert_eq!(fold_groups(65_536, 1, 1), Some((32_768, 2)));
+        assert_eq!(fold_groups(1 << 20, 1, 1), Some((65_536 / 2, 32)));
+    }
+
+    #[test]
+    fn every_fold_covers_x_exactly_and_fits() {
+        for x in (65_536u32..(1 << 20))
+            .step_by(997)
+            .chain([u32::MAX, (1 << 24) + 1])
+        {
+            if let Some((w, k)) = fold_groups(x, 1, 1) {
+                assert_eq!(u64::from(w) * u64::from(k), u64::from(x), "x {x}");
+                assert!(
+                    w <= HOST_GROUPS_PER_DIMENSION && k <= HOST_GROUPS_PER_DIMENSION,
+                    "x {x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_dimensional_or_prime_dispatches_are_not_folded() {
+        assert_eq!(fold_groups(77_500, 2, 1), None);
+        assert_eq!(fold_groups(77_500, 1, 3), None);
+        // 65,537 is prime: no exact fold.
+        assert_eq!(fold_groups(65_537, 1, 1), None);
+    }
+}
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
